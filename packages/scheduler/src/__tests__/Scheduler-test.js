@@ -150,6 +150,16 @@ describe('SchedulerBrowser', () => {
         log('Continuous Event');
       }
     }
+    // Simulates a browser that can fire a MessageChannel message re-entrantly
+    // while a task is already executing (e.g. Firefox when a native dialog like
+    // alert/confirm/prompt is shown, or when paused on a debugger breakpoint).
+    function fireReentrantMessageEvent() {
+      log('Reentrant Message Event');
+      const onMessage = port1.onmessage;
+      if (typeof onMessage === 'function') {
+        onMessage();
+      }
+    }
     function log(val) {
       eventLog.push(val);
     }
@@ -165,6 +175,7 @@ describe('SchedulerBrowser', () => {
       advanceTime,
       resetTime,
       fireMessageEvent,
+      fireReentrantMessageEvent,
       log,
       isLogEmpty,
       assertLog,
@@ -347,5 +358,61 @@ describe('SchedulerBrowser', () => {
 
     runtime.fireMessageEvent();
     runtime.assertLog(['Message Event', 'Continuation Task']);
+  });
+
+  it('does not process tasks re-entrantly when a message event fires during a task callback', () => {
+    // Regression test: In some browsers (e.g. Firefox), native dialogs like
+    // alert/confirm/prompt, or a debugger breakpoint, can cause a re-entrant
+    // event loop while a MessageChannel callback is executing. This allows a
+    // pending MessageChannel message to fire before the current callback
+    // finishes. Without a guard, the scheduler would execute tasks out of order
+    // (or even process them twice), potentially triggering "Should not already
+    // be working" errors in React.
+
+    let taskAIsExecuting = false;
+    let taskBExecutedDuringTaskA = false;
+
+    scheduleCallback(NormalPriority, () => {
+      taskAIsExecuting = true;
+      runtime.log('Task A');
+      // Simulate Firefox's re-entrant event loop (e.g., during alert()) by
+      // directly invoking the MessageChannel handler while Task A is still
+      // on the call stack.
+      runtime.fireReentrantMessageEvent();
+      taskAIsExecuting = false;
+    });
+
+    scheduleCallback(NormalPriority, () => {
+      // Record whether we are executing re-entrantly inside Task A.
+      taskBExecutedDuringTaskA = taskAIsExecuting;
+      runtime.log('Task B');
+    });
+
+    runtime.assertLog(['Post Message']);
+    runtime.fireMessageEvent();
+
+    if (gate(flags => flags.enableAlwaysYieldScheduler)) {
+      // With the always-yield scheduler, only one task runs per message event.
+      runtime.assertLog([
+        'Message Event',
+        'Task A',
+        'Reentrant Message Event',
+        'Post Message',
+      ]);
+      runtime.fireMessageEvent();
+      runtime.assertLog(['Message Event', 'Task B']);
+    } else {
+      runtime.assertLog([
+        'Message Event',
+        'Task A',
+        'Reentrant Message Event',
+        'Task B',
+      ]);
+    }
+
+    // Task B must NOT have been executed re-entrantly inside Task A's callback.
+    // Before the fix, the re-entrant message event would call flushWork again,
+    // causing Task B to run while Task A was still on the stack.
+    expect(taskBExecutedDuringTaskA).toBe(false);
   });
 });
