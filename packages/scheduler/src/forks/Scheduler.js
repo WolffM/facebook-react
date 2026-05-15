@@ -487,6 +487,14 @@ const performWorkUntilDeadline = () => {
     needsPaint = false;
   }
   if (isMessageLoopRunning) {
+    // Prevent re-entrant calls. Some browser environments (e.g. Firefox) can
+    // fire a pending MessageChannel message while a task callback is paused on
+    // a native dialog (alert/confirm/prompt) or a debugger breakpoint, because
+    // those APIs run a nested event loop. If that happens, we should skip the
+    // re-entrant invocation and let the outer call continue when it resumes.
+    if (isPerformingWork) {
+      return;
+    }
     const currentTime = getCurrentTime();
     // Keep track of the start time so we can measure how long the main thread
     // has been blocked.
